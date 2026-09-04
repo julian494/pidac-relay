@@ -1,0 +1,9 @@
+{
+  "name": "pidac-relay",
+  "version": "1.0.0",
+  "description": "Relay HTTPS publico para el stream del ESP32-CAM de PIDAC",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "express": "^4.19.2" },
+  "engines": { "node": ">=18" }
+}
