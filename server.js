@@ -64,69 +64,13 @@ app.post('/upload', (req, res) => {
   res.json({ ok: true });
 });
  
-// ── POST /upload-stream — el ESP32 abre UNA conexión y empuja frames
-//    seguidos sin esperar respuesta entre cada uno (Transfer-Encoding:
-//    chunked). Elimina el round-trip HTTP completo por frame que
-//    limitaba /upload: ahí cada foto pagaba ida-y-vuelta completa a
-//    Render antes de poder mandar la siguiente, así que el techo real
-//    de FPS era 1000/RTT (con RTT~200ms, max ~5fps) sin importar qué
-//    tan rápido subiera el ESP32. Aquí solo se paga el tiempo de subir
-//    los bytes del JPEG — el límite pasa a ser el ancho de banda real,
-//    no la latencia a Render.
-//
-//    Formato que debe mandar el ESP32 por cada frame, dentro del mismo
-//    cuerpo de la petición (como chunks HTTP normales):
-//      --pidacframe\r\nContent-Length: <N>\r\n\r\n<N bytes JPEG>\r\n
-app.post('/upload-stream', (req, res) => {
-  if (!checkSecret(req, res)) return;
-
-  let buf = Buffer.alloc(0);
-  const BOUNDARY = Buffer.from('--pidacframe\r\n');
-  const MAX_BUF = 3 * 1024 * 1024; // tope de seguridad por si algo queda mal formado
-
-  if (req.query.model || req.get('X-Model')) lastModel = req.query.model || req.get('X-Model');
-
-  req.on('data', chunk => {
-    buf = Buffer.concat([buf, chunk]);
-    if (buf.length > MAX_BUF) { buf = Buffer.alloc(0); return; } // corta-fuegos
-
-    // Procesa todos los frames completos que ya llegaron en este chunk
-    while (true) {
-      const bIdx = buf.indexOf(BOUNDARY);
-      if (bIdx === -1) break;
-      const headerStart = bIdx + BOUNDARY.length;
-      const headerEnd = buf.indexOf('\r\n\r\n', headerStart);
-      if (headerEnd === -1) break; // el header todavía no llegó completo, espera más datos
-
-      const headerStr = buf.slice(headerStart, headerEnd).toString();
-      const m = headerStr.match(/Content-Length:\s*(\d+)/i);
-      if (!m) { buf = buf.slice(headerEnd + 4); continue; } // header raro, descarta y sigue
-
-      const len = parseInt(m[1], 10);
-      const dataStart = headerEnd + 4;
-      const dataEnd = dataStart + len;
-      if (buf.length < dataEnd + 2) break; // el frame aún no llegó completo
-
-      const frame = buf.slice(dataStart, dataEnd);
-      lastFrame = frame;
-      lastFrameTime = Date.now();
-
-      const boundaryOut = '\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' +
-                           frame.length + '\r\n\r\n';
-      for (const client of streamClients) {
-        client.write(boundaryOut);
-        client.write(frame);
-      }
-
-      buf = buf.slice(dataEnd + 2); // salta el \r\n final de este frame
-    }
-  });
-
-  req.on('end',   () => { if (!res.headersSent) res.json({ ok: true }); });
-  req.on('close', () => { /* el ESP32 cortó la conexión — normal al reconectar */ });
-  req.on('error', () => { /* conexión caída a medias — normal en WiFi inestable */ });
-});
-
+// NOTA: hubo un intento de un endpoint /upload-stream (una sola conexión
+// eterna, sin ida-y-vuelta por foto) para subir más el fps. Se quitó:
+// Render (como la mayoría de plataformas con proxy delante) almacena en
+// buffer el cuerpo de la petición antes de pasarlo a esta app, y como esa
+// petición estaba diseñada para no terminar nunca, nunca llegaba nada —
+// el ESP32 volvió a /upload (una petición POST normal por foto).
+ 
 // ── GET /stream — MJPEG en vivo para el navegador (mismo formato que
 //    el ESP32 servía directo antes, así que el <img> del frontend no
 //    necesita cambiar de técnica, solo de URL).
@@ -181,4 +125,5 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log('PIDAC relay escuchando en puerto ' + PORT);
 });
+ 
  
