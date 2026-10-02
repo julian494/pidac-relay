@@ -15,23 +15,25 @@
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
- 
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 // Configúralo en Render → Environment. Si no existe, el relay RECHAZA subidas.
 const DEVICE_SECRET = process.env.DEVICE_SECRET || '';
- 
+
 let lastFrame = null;
 let lastFrameTime = 0;
 let lastModel = 'ESP32-CAM';
 let wsDevice = false;          // ¿hay un ESP32 conectado por WebSocket?
+let wsSock = null;             // socket del ESP32 (para mandarle ajustes)
+const desired = {};            // últimos ajustes pedidos desde PIDAC (se reenvían al reconectar)
 let framesIn = 0;              // contador para fps de entrada
 let fpsIn = 0;
- 
+
 const streamClients = new Set();
- 
+
 setInterval(() => { fpsIn = framesIn; framesIn = 0; }, 1000);
- 
+
 function broadcast(frame) {
   lastFrame = frame;
   lastFrameTime = Date.now();
@@ -44,11 +46,11 @@ function broadcast(frame) {
     c.write(frame);
   }
 }
- 
+
 function secretOk(given) {
   return DEVICE_SECRET !== '' && given === DEVICE_SECRET;
 }
- 
+
 // ── HTTP de respaldo
 app.use('/upload', express.raw({ type: '*/*', limit: '2mb' }));
 app.post('/upload', (req, res) => {
@@ -60,7 +62,7 @@ app.post('/upload', (req, res) => {
   broadcast(req.body);
   res.json({ ok: true });
 });
- 
+
 app.get('/stream', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
@@ -75,13 +77,13 @@ app.get('/stream', (req, res) => {
   streamClients.add(res);
   req.on('close', () => streamClients.delete(res));
 });
- 
+
 app.get('/snapshot', (req, res) => {
   if (!lastFrame) return res.status(503).json({ ok: false, error: 'sin frames aún' });
   res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' });
   res.send(lastFrame);
 });
- 
+
 app.get('/status', (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   const ageMs = lastFrame ? Date.now() - lastFrameTime : null;
@@ -93,24 +95,55 @@ app.get('/status', (req, res) => {
     viewers: streamClients.size,
     fpsIn,                 // fps reales que está recibiendo el relay
     transport: wsDevice ? 'websocket' : 'http',
+    settings: desired,
   });
 });
- 
+
+
+// ── POST /control?var=framesize&val=8 — PIDAC pide un ajuste de cámara.
+//    Se valida contra una lista cerrada y se manda al ESP32 por el WebSocket.
+//    OJO: PIDAC es una página pública, así que cualquiera que conozca esta URL
+//    podría llamarlo. Por eso solo acepta ajustes inofensivos y con rango fijo.
+const CONTROL_RULES = {
+  framesize: v => Number.isInteger(v) && v >= 5 && v <= 10,  // QVGA..XGA
+  quality:   v => Number.isInteger(v) && v >= 8 && v <= 40,
+  vflip:     v => v === 0 || v === 1,
+  hmirror:   v => v === 0 || v === 1,
+};
+let lastControlAt = 0;
+app.options('/control', (req, res) => {
+  res.set({ 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS' });
+  res.sendStatus(204);
+});
+app.post('/control', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  const v = String(req.query.var || '');
+  const n = Number(req.query.val);
+  if (!CONTROL_RULES[v] || !CONTROL_RULES[v](n)) return res.status(400).json({ ok: false, error: 'ajuste no permitido' });
+  if (Date.now() - lastControlAt < 300) return res.status(429).json({ ok: false, error: 'muy rápido' });
+  lastControlAt = Date.now();
+  desired[v] = n;
+  let delivered = false;
+  if (wsSock && wsSock.readyState === 1) { wsSock.send(v + '=' + n); delivered = true; }
+  res.json({ ok: true, delivered });
+});
+
 app.get('/', (req, res) => res.send('PIDAC relay v2 activo. /stream /snapshot /status /ws-upload'));
- 
+
 // ── WebSocket de subida (ESP32)
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws-upload', maxPayload: 2 * 1024 * 1024, perMessageDeflate: false });
- 
+
 wss.on('connection', (ws, req) => {
   if (!secretOk(req.headers['x-device-secret'])) { ws.close(1008, 'secret'); return; }
   if (req.headers['x-model']) lastModel = String(req.headers['x-model']);
   wsDevice = true;
+  wsSock = ws;
   console.log('ESP32 conectado por WebSocket');
+  for (const k of Object.keys(desired)) ws.send(k + '=' + desired[k]); // restaura ajustes tras reinicio
   ws.on('message', (data, isBinary) => { if (isBinary) broadcast(data); });
-  ws.on('close', () => { wsDevice = false; console.log('ESP32 desconectado'); });
+  ws.on('close', () => { if (wsSock === ws) { wsSock = null; wsDevice = false; } console.log('ESP32 desconectado'); });
   ws.on('error', () => {});
 });
- 
+
 server.listen(PORT, () => console.log('PIDAC relay v2 en puerto ' + PORT));
- 
