@@ -2,7 +2,10 @@
 //  PIDAC RELAY v2 — corre igual en Render (nube) o en tu portátil (local)
 //
 //  Rutas:
-//    POST /upload   — el ESP32 sube un frame JPEG (header X-Device-Secret)
+//    WS   /ws-upload?secret=XXX — el ESP32 sube frames por UN WebSocket
+//                   persistente (sin esperar respuesta por frame: lo más
+//                   rápido en la nube)
+//    POST /upload   — alternativa: un frame por petición (header X-Device-Secret)
 //    GET  /stream   — MJPEG en vivo para el navegador
 //    GET  /snapshot — última foto
 //    GET  /status   — JSON de estado
@@ -18,21 +21,22 @@
 //     problemas de Mixed Content)
 // ══════════════════════════════════════════════════════════════
 const express = require('express');
+const { WebSocketServer } = require('ws');
 const os = require('os');
 const path = require('path');
 const app = express();
- 
+
 const PORT = process.env.PORT || 3000;
 const DEVICE_SECRET = process.env.DEVICE_SECRET || 'cambia-esto';
- 
+
 let lastFrame = null;
 let lastFrameTime = 0;
 let lastModel = 'ESP32-CAM';
 const streamClients = new Set();
- 
+
 app.use('/upload', express.raw({ type: '*/*', limit: '2mb' }));
 app.use(express.static(path.join(__dirname, 'public'))); // opcional
- 
+
 function checkSecret(req, res) {
   const given = req.query.secret || req.get('X-Device-Secret');
   if (given !== DEVICE_SECRET) {
@@ -41,7 +45,7 @@ function checkSecret(req, res) {
   }
   return true;
 }
- 
+
 function broadcast(frame) {
   const head = '--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + frame.length + '\r\n\r\n';
   for (const c of streamClients) {
@@ -51,22 +55,24 @@ function broadcast(frame) {
     c.write('\r\n');
   }
 }
- 
+
+function acceptFrame(buf, model) {
+  if (model) lastModel = model;
+  lastFrame = buf;
+  lastFrameTime = Date.now();
+  broadcast(lastFrame);
+}
+
 app.post('/upload', (req, res) => {
   if (!checkSecret(req, res)) return;
   if (!req.body || !req.body.length) {
     return res.status(400).json({ ok: false, error: 'body vacío' });
   }
   req.socket.setNoDelay(true);
-  if (req.query.model || req.get('X-Model')) lastModel = req.query.model || req.get('X-Model');
- 
-  lastFrame = req.body;
-  lastFrameTime = Date.now();
-  broadcast(lastFrame);
- 
+  acceptFrame(req.body, req.query.model || req.get('X-Model'));
   res.json({ ok: true });
 });
- 
+
 app.get('/stream', (req, res) => {
   req.socket.setNoDelay(true);
   res.writeHead(200, {
@@ -77,17 +83,17 @@ app.get('/stream', (req, res) => {
     'Access-Control-Allow-Origin': '*',
   });
   res.flushHeaders();
- 
+
   if (lastFrame) {
     res.write('--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + lastFrame.length + '\r\n\r\n');
     res.write(lastFrame);
     res.write('\r\n');
   }
- 
+
   streamClients.add(res);
   req.on('close', () => streamClients.delete(res));
 });
- 
+
 app.get('/snapshot', (req, res) => {
   if (!lastFrame) return res.status(503).json({ ok: false, error: 'sin frames aún' });
   res.set({
@@ -97,7 +103,7 @@ app.get('/snapshot', (req, res) => {
   });
   res.send(lastFrame);
 });
- 
+
 app.get('/status', (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   const ageMs = lastFrame ? Date.now() - lastFrameTime : null;
@@ -109,11 +115,11 @@ app.get('/status', (req, res) => {
     viewers: streamClients.size,
   });
 });
- 
+
 app.get('/', (req, res) => {
   res.send('PIDAC relay activo. Endpoints: /stream /snapshot /status /upload');
 });
- 
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('PIDAC relay escuchando en puerto ' + PORT);
   const ips = [];
@@ -126,6 +132,25 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   }
   console.log('\nPIDAC (en este mismo PC) lee: http://localhost:' + PORT + '/stream\n');
 });
+// ── WebSocket de subida: /ws-upload?secret=XXX&model=YYY
+const wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname !== '/ws-upload' || url.searchParams.get('secret') !== DEVICE_SECRET) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    return socket.destroy();
+  }
+  socket.setNoDelay(true);
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    const model = (url.searchParams.get('model') || '').replace(/-/g, ' ') || null;
+    console.log('ESP32 conectado por WebSocket');
+    ws.on('message', (data, isBinary) => {
+      if (isBinary) acceptFrame(Buffer.isBuffer(data) ? data : Buffer.concat(data), model);
+    });
+    ws.on('close', () => console.log('ESP32 WebSocket cerrado'));
+    ws.on('error', () => {});
+  });
+});
+
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
- 
