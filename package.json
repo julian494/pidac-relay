@@ -2,18 +2,10 @@
   "name": "pidac-relay",
   "version": "2.0.0",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "express": "^4.22.3",
-    "ws": "^8.22.0"
-  },
-  "engines": {
-    "node": ">=18"
-  },
-  "description": "",
-  "keywords": [],
-  "author": "",
-  "license": "ISC"
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
 }
